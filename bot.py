@@ -258,7 +258,7 @@ def search_keyboard(query, page, results):
     token = uuid.uuid4().hex[:8]
     SESSIONS[token] = {"query": query, "ts": time.time()}
     for t in results:
-        VID_QUERY[t["id"]] = query
+        VID_QUERY[t["vid"]] = query
     rows = [[InlineKeyboardButton(fmt_line(t)[:64], callback_data=f"d:{t['vid']}")]
             for t in results[:10]]
     nav = [InlineKeyboardButton("➕ More tracks", callback_data=f"p:{token}:{page + 1}"),
