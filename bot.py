@@ -1082,7 +1082,6 @@ def run_http():
 
 
 def main():
-    threading.Thread(target=run_http, daemon=True).start()
     app = (ApplicationBuilder().token(TOKEN)
            .read_timeout(300).write_timeout(300).connect_timeout(60)
            .media_write_timeout(300).build())
@@ -1094,8 +1093,14 @@ def main():
     app.add_handler(MessageHandler(
         filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.ATTACHMENT,
         on_media))
-    log.info("bot starting (long polling)")
-    app.run_polling(drop_pending_updates=True)
+    base = os.environ.get("RENDER_EXTERNAL_URL", "https://gana-finder-bot.onrender.com").rstrip("/")
+    path = "tg-" + TOKEN.split(":")[-1][:24].replace("_", "x").replace("-", "y")
+    port = int(os.environ.get("PORT", "10000"))
+    log.info("bot starting (webhook, wakes sleeping server)")
+    app.run_webhook(listen="0.0.0.0", port=port, url_path=path,
+                    webhook_url=base + "/" + path,
+                    drop_pending_updates=False,
+                    allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
