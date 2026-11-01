@@ -39,7 +39,8 @@ INVIDIOUS = ["https://yt.chocolatemoo53.com"]
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
 MAX_SECONDS = 15 * 60  # refuse downloads longer than 15 min
 
-SESSIONS = {}  # token -> {"query": str, "ts": float}
+SESSIONS = {}
+VID_QUERY = {}  # token -> {"query": str, "ts": float}
 shazam = Shazam()
 
 
@@ -172,26 +173,76 @@ async def recognize_file(path):
     return {"title": t["title"], "artist": t.get("subtitle") or ""}
 
 
-def get_lyrics(artist, title):
-    try:
-        r = requests.get("https://lrclib.net/api/get",
-                         params={"artist_name": artist, "track_name": title}, timeout=15)
-        if r.status_code == 200:
-            return r.json().get("plainLyrics")
-    except Exception:
-        pass
+def clean_title(t):
+    t = t.split("|")[0]
+    t = re.sub(r"[\(\[].*?[\)\]]", " ", t)
+    t = re.sub(r"(?i)\b(official|video|audio|lyrical|lyric|lyrics|full song|hd|4k|8k|mv|music video)\b", " ", t)
+    return re.sub(r"\s+", " ", t).strip(" -")
+
+
+def _lrclib(path, params):
+    for attempt in range(3):
+        try:
+            r = requests.get(f"https://lrclib.net/api/{path}", params=params, timeout=8)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 503):
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return None
+        except Exception:
+            return None
     return None
 
 
-def search_lyrics(q):
-    try:
-        r = requests.get("https://lrclib.net/api/search", params={"q": q}, timeout=15)
-        if r.status_code == 200:
-            for item in r.json():
+def get_lyrics(artist, title, query=None):
+    arts = []
+    for p in title.split("|")[1:]:
+        p = p.strip()
+        if 0 < len(p) <= 25 and len(p.split()) <= 3:
+            arts.append(p)
+    c = (artist or "").replace("VEVO", "").replace(" - Topic", "").strip()
+    if c and len(c) < 40:
+        arts.append(c)
+    arts = list(dict.fromkeys(arts))[:6]
+
+    qt = clean_title(title)
+    tracks = []
+    for seg in qt.split(" - "):
+        seg = seg.strip()
+        if seg:
+            tracks.append(seg)
+    tracks.append(qt)
+    if query and query.strip():
+        tracks.append(query.strip())
+    tracks = list(dict.fromkeys(tracks))[:4]
+
+    for t in tracks:
+        for a in arts:
+            d = _lrclib("get", {"track_name": t, "artist_name": a})
+            if d and d.get("plainLyrics"):
+                return d["plainLyrics"]
+            time.sleep(0.3)
+
+    qs = []
+    if query and query.strip() and len(query.split()) >= 2:
+        qs.append(query.strip())
+    for t in tracks[:2]:
+        for a in arts[:2]:
+            qs.append(f"{t} {a}")
+        if len(t.split()) >= 2:
+            qs.append(t)
+    seen = set()
+    for q in qs:
+        if q in seen:
+            continue
+        seen.add(q)
+        items = _lrclib("search", {"q": q})
+        if items:
+            for item in items:
                 if item.get("plainLyrics"):
                     return item["plainLyrics"]
-    except Exception:
-        pass
+        time.sleep(0.3)
     return None
 
 
@@ -206,6 +257,8 @@ def fmt_line(t):
 def search_keyboard(query, page, results):
     token = uuid.uuid4().hex[:8]
     SESSIONS[token] = {"query": query, "ts": time.time()}
+    for t in results:
+        VID_QUERY[t["id"]] = query
     rows = [[InlineKeyboardButton(fmt_line(t)[:64], callback_data=f"d:{t['vid']}")]
             for t in results[:10]]
     nav = [InlineKeyboardButton("➕ More tracks", callback_data=f"p:{token}:{page + 1}"),
@@ -364,11 +417,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data or ""
     try:
-        await q.answer()
-    except Exception:
-        pass
-    try:
         if data == "x":
+            await q.answer()
             await q.message.delete()
         elif data.startswith("p:"):
             _, token, page = data.split(":")
@@ -380,19 +430,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not results:
                 await q.answer("Aur results nahi mile.", show_alert=True)
                 return
+            await q.answer()
             await q.message.edit_reply_markup(
                 reply_markup=search_keyboard(sess["query"], int(page), results))
         elif data.startswith("d:"):
+            await q.answer()
             await send_song(q.message, data[2:], context)
         elif data.startswith("l:"):
+            await q.answer()
             await q.message.reply_text("🔤 Lyrics dhoondh raha hoon...")
             meta = await asyncio.to_thread(video_meta, data[2:])
             if not meta:
                 await q.message.reply_text("Lyrics nahi mili.")
                 return
-            lyrics = await asyncio.to_thread(get_lyrics, meta["channel"], meta["title"])
-            if not lyrics:
-                lyrics = await asyncio.to_thread(search_lyrics, f"{meta['title']} {meta['channel']}")
+            lyrics = await asyncio.to_thread(get_lyrics, meta["channel"], meta["title"], VID_QUERY.get(data[2:]))
             if not lyrics:
                 await q.message.reply_text(f"Is track ki lyrics uplabdh nahi hai: {meta['title']}")
                 return
