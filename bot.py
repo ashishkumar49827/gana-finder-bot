@@ -1084,7 +1084,7 @@ def run_http():
 def main():
     app = (ApplicationBuilder().token(TOKEN)
            .read_timeout(300).write_timeout(300).connect_timeout(60)
-           .media_write_timeout(300).build())
+           .media_write_timeout(300).concurrent_updates(True).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("language", lang_cmd))
