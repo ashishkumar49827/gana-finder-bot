@@ -5,6 +5,7 @@ import time
 import uuid
 import asyncio
 import logging
+import shutil
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -25,12 +26,12 @@ log = logging.getLogger("ytmusicbot")
 
 WELCOME = (
     "Namaste! 🎵\n\n"
-    "Main gaane dhoondh kar MP3 bhejta hoon. Mujhe bhejo:\n\n"
+    "Main gaane dhoondh kar MP3 bhejta hoon aur links se video download karta hoon. Mujhe bhejo:\n\n"
     "📝 Gaane ka naam, singer, ya lyrics ki line\n"
     "🎤 Voice note jisme gaana baj raha ho\n"
     "🎬 Audio ya video jisme gaana ho\n"
-    "🔗 YouTube, Instagram ya TikTok link\n\n"
-    "Phir list se gaana chuno aur MP3 pao. Enjoy!"
+    "🔗 YouTube, Instagram ya TikTok link (video download ho jayega)\n\n"
+    "Har gaane ke neeche Lyrics, Video aur Info (saare music apps ke links) buttons milte hain. Enjoy!"
 )
 
 NO_RESULT = "Is naam se kuch nahi mila. Naam thoda badal kar bhejo (singer ka naam jodo)."
@@ -41,6 +42,8 @@ MAX_SECONDS = 15 * 60  # refuse downloads longer than 15 min
 
 SESSIONS = {}
 VID_QUERY = {}  # token -> {"query": str, "ts": float}
+LINK_AUD = {}  # token -> {"mp3": str, "ts": float}
+MAX_VIDEO_BYTES = 49 * 1024 * 1024  # Telegram bot upload limit is 50 MB
 shazam = Shazam()
 
 
@@ -148,6 +151,79 @@ def download_mp3(vid, workdir):
     except Exception as exc:
         log.info("ffmpeg failed: %s", exc)
         return None
+
+
+def download_video(vid, workdir, max_bytes=MAX_VIDEO_BYTES):
+    """Download muxed mp4 (360p/720p) via invidious proxy. Returns path or None."""
+    mp4 = os.path.join(workdir, f"{vid}.mp4")
+    for itag in ("18", "22"):
+        for host in INVIDIOUS:
+            try:
+                url = f"{host}/latest_version?id={vid}&itag={itag}&local=true"
+                with requests.get(url, stream=True, timeout=(15, 300)) as r:
+                    if r.status_code != 200:
+                        continue
+                    cl = r.headers.get("Content-Length")
+                    if cl and int(cl) > max_bytes:
+                        log.info("video too big: %s bytes", cl)
+                        return None
+                    size = 0
+                    with open(mp4, "wb") as f:
+                        for chunk in r.iter_content(1 << 16):
+                            size += len(chunk)
+                            if size > max_bytes:
+                                log.info("video exceeded %s bytes mid-stream", max_bytes)
+                                return None
+                            f.write(chunk)
+                if os.path.getsize(mp4) > 10000:
+                    return mp4
+            except Exception as exc:
+                log.info("video itag=%s host=%s failed: %s", itag, host, exc)
+    return None
+
+
+def file_to_mp3(src, workdir, name="aud", max_seconds=120):
+    mp3 = os.path.join(workdir, name + ".mp3")
+    subprocess.run([FFMPEG, "-y", "-i", src, "-t", str(max_seconds),
+                    "-c:a", "libmp3lame", "-q:a", "4", mp3],
+                   check=True, capture_output=True, timeout=120)
+    return mp3
+
+
+def download_video_link(text, workdir, max_bytes=MAX_VIDEO_BYTES):
+    """Download video from non-YouTube sites (Instagram, TikTok etc.) via yt_dlp."""
+    import yt_dlp
+    out = os.path.join(workdir, "v.%(ext)s")
+    opts = {"quiet": True, "format": "best[ext=mp4]/best",
+            "outtmpl": out, "ffmpeg_location": FFMPEG,
+            "max_filesize": max_bytes}
+    with yt_dlp.YoutubeDL(opts) as y:
+        y.download([text])
+    for ext in ("mp4", "mkv", "webm", "mov", "ts"):
+        p = os.path.join(workdir, f"v.{ext}")
+        if os.path.exists(p) and os.path.getsize(p) > 10000:
+            return p
+    return None
+
+
+def _janitor():
+    """Drop stale link-audio tokens and old temp dirs (free tier has small disk)."""
+    now = time.time()
+    for tok, d in list(LINK_AUD.items()):
+        if now - d["ts"] > 1800:
+            LINK_AUD.pop(tok, None)
+    try:
+        names = os.listdir("/tmp")
+    except OSError:
+        return
+    for name in names:
+        if name.startswith(("dl_", "yt_", "ln_", "md_", "vd_")):
+            p = os.path.join("/tmp", name)
+            try:
+                if now - os.path.getmtime(p) > 1800:
+                    shutil.rmtree(p, ignore_errors=True)
+            except OSError:
+                pass
 
 
 def bytes_to_mp3(data, workdir, name="in", max_seconds=90):
@@ -300,13 +376,46 @@ async def send_song(message, vid, context):
                 title=title[:64], performer=artist[:64],
                 duration=meta.get("seconds") if meta else None,
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🔤 Lyrics", callback_data=f"l:{vid}")]]),
+                    [[InlineKeyboardButton("🔤 Lyrics", callback_data=f"l:{vid}"),
+                      InlineKeyboardButton("🎬 Video", callback_data=f"v:{vid}"),
+                      InlineKeyboardButton("ℹ️ Info", url=f"https://song.link/y/{vid}")]]),
                 write_timeout=300, read_timeout=300,
             )
         await status.delete()
     except Exception as exc:
         log.warning("send audio failed: %s", exc)
         await status.edit_text("File bhejne mein dikkat aayi. Dobara try karo.")
+
+
+async def send_video_file(message, vid):
+    """Download vid as mp4 and send it with an Info button."""
+    meta = await asyncio.to_thread(video_meta, vid)
+    if meta and meta.get("seconds") and meta["seconds"] > MAX_SECONDS:
+        await message.reply_text("Ye video bahut lamba hai (15 min se zyada), isey bhej nahi sakta.")
+        return
+    status = await message.reply_text("🎬 Video download ho raha hai, thoda intezaar karo (1-2 min lag sakte hain)...")
+    workdir = f"/tmp/vd_{uuid.uuid4().hex[:8]}"
+    os.makedirs(workdir, exist_ok=True)
+    mp4 = await asyncio.to_thread(download_video, vid, workdir)
+    if not mp4:
+        await status.edit_text("Maaf karna, abhi ye video download nahi ho paya. Thodi der baad try karo ya MP3 hi use karo.")
+        return
+    title = meta["title"] if meta else "Video"
+    try:
+        with open(mp4, "rb") as f:
+            await message.reply_video(
+                video=f,
+                caption=f"🎬 {title}"[:200],
+                duration=meta.get("seconds") if meta else None,
+                supports_streaming=True,
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("ℹ️ Info", url=f"https://song.link/y/{vid}")]]),
+                write_timeout=300, read_timeout=300,
+            )
+        await status.delete()
+    except Exception as exc:
+        log.warning("send video failed: %s", exc)
+        await status.edit_text("Video bhejne mein dikkat aayi. Dobara try karo.")
 
 
 # ---------- handlers ----------
@@ -336,42 +445,108 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_youtube_link(update: Update, vid):
-    status = await update.message.reply_text("🎧 Link mila, audio nikal kar pehchan raha hoon (1-2 min)...")
+    _janitor()
+    status = await update.message.reply_text("🎬 Link mila, video download kar raha hoon (1-2 min lag sakte hain)...")
+    meta = await asyncio.to_thread(video_meta, vid)
+    if meta and meta.get("seconds") and meta["seconds"] > MAX_SECONDS:
+        await status.edit_text("Ye video bahut lamba hai (15 min se zyada), isey bhej nahi sakta.")
+        return
     workdir = f"/tmp/yt_{uuid.uuid4().hex[:8]}"
     os.makedirs(workdir, exist_ok=True)
-    mp3 = await asyncio.to_thread(download_mp3, vid, workdir)
-    if not mp3:
-        await status.edit_text("Is link ka audio nahi nikal paya. Dobara ya kisi aur link se try karo.")
+    mp4 = await asyncio.to_thread(download_video, vid, workdir)
+    if not mp4:
+        await status.edit_text("🎧 Video nahi nikal paya, audio se gaana pehchan raha hoon...")
+        mp3 = await asyncio.to_thread(download_mp3, vid, workdir)
+        if not mp3:
+            await status.edit_text("Is link ka audio/video nahi nikal paya. Dobara ya kisi aur link se try karo.")
+            return
+        await finish_recognition(update, status, mp3)
         return
-    await finish_recognition(update, status, mp3)
+    title = meta["title"] if meta else "Video"
+    token = uuid.uuid4().hex[:8]
+    rows = []
+    try:
+        mp3 = await asyncio.to_thread(file_to_mp3, mp4, workdir)
+        LINK_AUD[token] = {"mp3": mp3, "ts": time.time()}
+        rows.append([InlineKeyboardButton("🎵 Gaana pehchano", callback_data=f"r:{token}"),
+                     InlineKeyboardButton("ℹ️ Info", url=f"https://song.link/y/{vid}")])
+    except Exception as exc:
+        log.info("link audio extract failed: %s", exc)
+        rows.append([InlineKeyboardButton("ℹ️ Info", url=f"https://song.link/y/{vid}")])
+    try:
+        with open(mp4, "rb") as f:
+            await update.message.reply_video(
+                video=f,
+                caption=f"🎬 {title}\n🔗 Source: https://youtu.be/{vid}"[:1024],
+                duration=meta.get("seconds") if meta else None,
+                supports_streaming=True,
+                reply_markup=InlineKeyboardMarkup(rows),
+                write_timeout=300, read_timeout=300,
+            )
+        await status.delete()
+    except Exception as exc:
+        log.warning("send yt video failed: %s", exc)
+        await status.edit_text("Video bhejne mein dikkat aayi. Dobara try karo.")
 
 
 async def handle_other_link(update: Update, text):
-    status = await update.message.reply_text("🎧 Link se audio nikal raha hoon...")
+    _janitor()
+    status = await update.message.reply_text("🎬 Link se video nikal raha hoon (1-2 min lag sakte hain)...")
     workdir = f"/tmp/ln_{uuid.uuid4().hex[:8]}"
     os.makedirs(workdir, exist_ok=True)
-    out = os.path.join(workdir, "a.%(ext)s")
-    def _dl():
-        import yt_dlp
-        opts = {"quiet": True, "format": "bestaudio/best", "outtmpl": out,
-                "ffmpeg_location": FFMPEG,
-                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}]}
-        with yt_dlp.YoutubeDL(opts) as y:
-            y.download([text])
-        p = os.path.join(workdir, "a.mp3")
-        return p if os.path.exists(p) else None
     try:
-        mp3 = await asyncio.to_thread(_dl)
+        mp4 = await asyncio.to_thread(download_video_link, text, workdir)
     except Exception as exc:
-        log.info("link download failed: %s", exc)
-        mp3 = None
-    if not mp3:
-        await status.edit_text("Is link se audio nahi nikal paya. YouTube link ya voice note try karo.")
+        log.info("link video download failed: %s", exc)
+        mp4 = None
+    if mp4 and os.path.getsize(mp4) > MAX_VIDEO_BYTES:
+        mp4 = None
+    if not mp4:
+        await status.edit_text("🎧 Video nahi nikal paya, audio se gaana pehchan raha hoon...")
+        out = os.path.join(workdir, "a.%(ext)s")
+        def _dl():
+            import yt_dlp
+            opts = {"quiet": True, "format": "bestaudio/best", "outtmpl": out,
+                    "ffmpeg_location": FFMPEG,
+                    "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}]}
+            with yt_dlp.YoutubeDL(opts) as y:
+                y.download([text])
+            p = os.path.join(workdir, "a.mp3")
+            return p if os.path.exists(p) else None
+        try:
+            mp3 = await asyncio.to_thread(_dl)
+        except Exception as exc:
+            log.info("link download failed: %s", exc)
+            mp3 = None
+        if not mp3:
+            await status.edit_text("Is link se audio/video nahi nikal paya. YouTube link ya voice note try karo.")
+            return
+        await finish_recognition(update, status, mp3)
         return
-    await finish_recognition(update, status, mp3)
+    token = uuid.uuid4().hex[:8]
+    rows = []
+    try:
+        mp3 = await asyncio.to_thread(file_to_mp3, mp4, workdir)
+        LINK_AUD[token] = {"mp3": mp3, "ts": time.time()}
+        rows.append([InlineKeyboardButton("🎵 Gaana pehchano", callback_data=f"r:{token}")])
+    except Exception as exc:
+        log.info("link audio extract failed: %s", exc)
+    try:
+        with open(mp4, "rb") as f:
+            await update.message.reply_video(
+                video=f,
+                caption=f"🔗 Source: {text}"[:1024],
+                supports_streaming=True,
+                reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+                write_timeout=300, read_timeout=300,
+            )
+        await status.delete()
+    except Exception as exc:
+        log.warning("send link video failed: %s", exc)
+        await status.edit_text("Video bhejne mein dikkat aayi. Dobara try karo.")
 
 
-async def finish_recognition(update: Update, status, mp3_path):
+async def finish_recognition_msg(message, status, mp3_path):
     try:
         rec = await recognize_file(mp3_path)
     except Exception as exc:
@@ -386,7 +561,11 @@ async def finish_recognition(update: Update, status, mp3_path):
     q = f"{title} {artist}".strip()
     results = await asyncio.to_thread(yt_search, q)
     if results:
-        await send_song(update.message, results[0]["vid"], None)
+        await send_song(message, results[0]["vid"], None)
+
+
+async def finish_recognition(update: Update, status, mp3_path):
+    await finish_recognition_msg(update.message, status, mp3_path)
 
 
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -436,6 +615,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("d:"):
             await q.answer()
             await send_song(q.message, data[2:], context)
+        elif data.startswith("v:"):
+            await q.answer()
+            await send_video_file(q.message, data[2:])
+        elif data.startswith("r:"):
+            await q.answer()
+            entry = LINK_AUD.get(data[2:])
+            if not entry or not os.path.exists(entry["mp3"]):
+                await q.message.reply_text("Ye audio purana ho gaya, link dobara bhejo.")
+                return
+            rstatus = await q.message.reply_text("🎧 Sun raha hoon, gaana pehchan raha hoon...")
+            await finish_recognition_msg(q.message, rstatus, entry["mp3"])
         elif data.startswith("l:"):
             await q.answer()
             await q.message.reply_text("🔤 Lyrics dhoondh raha hoon...")
